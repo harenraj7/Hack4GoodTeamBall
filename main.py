@@ -63,7 +63,6 @@ def month_key_local(ts: int) -> str:
     lt = time.localtime(int(ts))
     return f"{lt.tm_year:04d}-{lt.tm_mon:02d}"
 
-# Month label like "Jan 2026"
 def month_label(key: str) -> str:
     y, m = key.split("-")
     month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -345,7 +344,6 @@ def admin_add_activity(title: str, description: str, location: str, start_ts: in
         """, (title.strip(), description.strip(), location.strip(), int(start_ts), int(end_ts), int(capacity)))
         return int(cur.lastrowid)
 
-# Admin month view helpers
 def list_upcoming_month_keys() -> List[str]:
     acts = list_activities()
     keys = []
@@ -400,7 +398,6 @@ def admin_panel_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-# Step-by-step Activities list: names only
 def activities_name_list_kb(acts: List[Tuple]) -> InlineKeyboardMarkup:
     rows = []
     for a in acts:
@@ -437,7 +434,6 @@ def caregiver_confirm_kb(activity_id: int, individual_handle: str) -> InlineKeyb
         ]
     ])
 
-# ✅ Month buttons grid (2 per row) + back button
 def admin_months_kb(keys: List[str]) -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(month_label(k), callback_data=f"ADM_MONTH|{k}") for k in keys]
     rows = []
@@ -482,7 +478,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Menu:", reply_markup=main_menu_keyboard())
         return
 
-    # Role selection (emoji-safe) BEFORE wizard routing
     if context.user_data.get("awaiting") == "REG_ROLE":
         lower = text.lower()
         if "individual" in lower:
@@ -701,7 +696,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Cancelled." if ok else "No such booking.", reply_markup=main_menu_keyboard())
         return
 
-    # Admin add event wizard
     if awaiting == "ADM_TITLE":
         tmp["title"] = msg
         context.user_data["tmp"] = tmp
@@ -765,7 +759,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Event created: #{act_id}", reply_markup=main_menu_keyboard())
         return
 
-    # Individual booking: caregiver handle
     if awaiting == "IND_CG_HANDLE":
         cg_handle = norm_handle(msg)
         activity_id = int(tmp["activity_id"])
@@ -803,23 +796,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Caregiver notified (pending confirmation).", reply_markup=main_menu_keyboard())
         return
 
-    # Caregiver add individual wizard
-    if awaiting == "ADDIND_NAME":
-        tmp["ind_name"] = msg
-        context.user_data["tmp"] = tmp
-        context.user_data["awaiting"] = "ADDIND_HANDLE"
-        await update.message.reply_text("Individual's Telegram handle (e.g., @john123):")
-        return
-
-    if awaiting == "ADDIND_HANDLE":
-        ind_handle = norm_handle(msg)
-        ind_name = tmp.get("ind_name", "Individual")
-        individual_profile_upsert(ind_handle, ind_name)
-        caregiver_link_add(handle, ind_handle)
-        context.user_data.clear()
-        await update.message.reply_text(f"Added & linked: {ind_name} (@{ind_handle})", reply_markup=main_menu_keyboard())
-        return
-
     context.user_data.clear()
     await update.message.reply_text("Flow reset. Use /start.", reply_markup=main_menu_keyboard())
 
@@ -835,7 +811,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = data.split("|")
     action = parts[0]
 
-    # Back to activity list
     if action == "ACTLIST":
         acts = list_activities()
         if not acts:
@@ -845,7 +820,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.message.reply_text("Activities:", reply_markup=activities_name_list_kb(acts))
         return
 
-    # Activity details view
     if action == "ACT":
         act_id = int(parts[1])
         act = activity_get(act_id)
@@ -863,7 +837,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text(text, reply_markup=activity_detail_kb(act_id))
         return
 
-    # ✅ Back/list months callbacks
     if action == "ADM_MONTHS":
         cmd = parts[1] if len(parts) > 1 else "LIST"
         if cmd in ("LIST", "BACK"):
@@ -875,9 +848,8 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text("Months:", reply_markup=admin_months_kb(keys))
             return
 
-    # Admin month selection => list events + back button
     if action == "ADM_MONTH":
-        month = parts[1]  # YYYY-MM
+        month = parts[1]
         acts = activities_in_month(month)
         if not acts:
             await q.edit_message_text(f"No events for {month_label(month)}.", reply_markup=admin_back_to_months_kb())
@@ -892,7 +864,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text("\n".join(lines), reply_markup=admin_back_to_months_kb())
         return
 
-    # Booking routes by role
     if action == "BOOK":
         act_id = int(parts[1])
         u = user_get(handle)
@@ -918,7 +889,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await q.edit_message_text("No linked individuals. Use /add_individual first.")
                 return
             await q.edit_message_text(
-                "Select individual to book for:",
+                "Select individual to book for:\n(Caregiver will be automatically included as attending.)",
                 reply_markup=caregiver_pick_individual_kb(handle, act_id),
             )
             return
@@ -936,6 +907,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text("Type your caregiver’s Telegram handle (e.g., @caregiver123):")
         return
 
+    # ✅ CHANGE HERE: caregiver auto-tagged as attending (confirmed)
     if action == "CGBOOK":
         act_id = int(parts[1])
         ind_handle = norm_handle(parts[2])
@@ -945,8 +917,17 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.edit_message_text("You can only book for individuals linked to your caregiver account.")
             return
 
-        ok, msg = create_booking(act_id, ind_handle, handle, None, None)
-        await q.edit_message_text(msg)
+        ok, msg = create_booking(
+            activity_id=act_id,
+            individual_handle=ind_handle,
+            booked_by=handle,
+            caregiver_handle=handle,          # caregiver automatically attached
+            caregiver_status="confirmed",     # and confirmed
+        )
+        if ok:
+            await q.edit_message_text("Booked successfully. Caregiver is included as attending ✅")
+        else:
+            await q.edit_message_text(msg)
         return
 
     if action == "CGCONF":
