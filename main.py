@@ -32,6 +32,9 @@ def now_ts() -> int:
 def fmt_dt(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
 
+def fmt_time(ts: int) -> str:
+    return time.strftime("%H:%M", time.localtime(int(ts)))
+
 def parse_local_dt(s: str) -> Optional[int]:
     try:
         t = time.strptime(s.strip(), "%Y-%m-%d %H:%M")
@@ -56,6 +59,18 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+def month_key_local(ts: int) -> str:
+    lt = time.localtime(int(ts))
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}"
+
+# Month label like "Jan 2026"
+def month_label(key: str) -> str:
+    y, m = key.split("-")
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    mi = int(m)
+    mn = month_names[mi - 1] if 1 <= mi <= 12 else m
+    return f"{mn} {y}"
+
 # ------------------------
 # DB init
 # ------------------------
@@ -71,14 +86,12 @@ def init_db() -> None:
             chat_id INTEGER
         );
 
-        -- Individuals under care (may exist even if they don't run the bot)
         CREATE TABLE IF NOT EXISTS individual_profiles (
-            handle TEXT PRIMARY KEY,     -- telehandle of the individual
+            handle TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             created_ts INTEGER NOT NULL
         );
 
-        -- Caregiver -> individuals mapping
         CREATE TABLE IF NOT EXISTS caregiver_links (
             caregiver_handle TEXT NOT NULL,
             individual_handle TEXT NOT NULL,
@@ -97,13 +110,6 @@ def init_db() -> None:
             capacity INTEGER NOT NULL
         );
 
-        /*
-          Booking model:
-          - individual_handle always set
-          - booked_by_handle: who initiated the booking (individual or caregiver)
-          - caregiver_handle: optional caregiver joining with individual
-          - caregiver_status: 'pending'|'confirmed'|'declined'|NULL
-        */
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             activity_id INTEGER NOT NULL,
@@ -246,7 +252,7 @@ def booking_conflict(individual_handle: str, act_id: int) -> Optional[str]:
     if not hit:
         return None
     title, s, e = hit
-    return f"Conflicts with {title} ({fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))})"
+    return f"Conflicts with {title} ({fmt_dt(int(s))}-{fmt_time(int(e))})"
 
 def create_booking(activity_id: int, individual_handle: str, booked_by: str,
                    caregiver_handle: Optional[str], caregiver_status: Optional[str]) -> Tuple[bool, str]:
@@ -339,6 +345,32 @@ def admin_add_activity(title: str, description: str, location: str, start_ts: in
         """, (title.strip(), description.strip(), location.strip(), int(start_ts), int(end_ts), int(capacity)))
         return int(cur.lastrowid)
 
+# Admin month view helpers
+def list_upcoming_month_keys() -> List[str]:
+    acts = list_activities()
+    keys = []
+    seen = set()
+    cur = now_ts()
+    for a in acts:
+        start_ts = int(a[4])
+        if start_ts < cur:
+            continue
+        k = month_key_local(start_ts)
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+def activities_in_month(month_key: str) -> List[Tuple]:
+    acts = list_activities()
+    out = []
+    for a in acts:
+        start_ts = int(a[4])
+        if month_key_local(start_ts) == month_key:
+            out.append(a)
+    out.sort(key=lambda x: (int(x[4]), int(x[0])))
+    return out
+
 # ------------------------
 # UI
 # ------------------------
@@ -362,19 +394,26 @@ def register_role_keyboard() -> ReplyKeyboardMarkup:
 
 def admin_panel_keyboard() -> ReplyKeyboardMarkup:
     kb = [
-        [KeyboardButton("➕ Add Event"), KeyboardButton("⬅️ Back")],
+        [KeyboardButton("➕ Add Event")],
+        [KeyboardButton("📆 View Events by Month")],
+        [KeyboardButton("⬅️ Back")],
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-def activities_inline_kb(acts: List[Tuple]) -> InlineKeyboardMarkup:
+# Step-by-step Activities list: names only
+def activities_name_list_kb(acts: List[Tuple]) -> InlineKeyboardMarkup:
     rows = []
     for a in acts:
-        act_id, title = int(a[0]), a[1]
-        rows.append([
-            InlineKeyboardButton(f"ℹ️ Details #{act_id}", callback_data=f"DETAILS|{act_id}"),
-            InlineKeyboardButton(f"✅ Book #{act_id}", callback_data=f"BOOK|{act_id}"),
-        ])
+        act_id, title, start_ts = int(a[0]), a[1], int(a[4])
+        label = f"{title} • {fmt_dt(start_ts)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"ACT|{act_id}")])
     return InlineKeyboardMarkup(rows)
+
+def activity_detail_kb(act_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Book", callback_data=f"BOOK|{act_id}")],
+        [InlineKeyboardButton("⬅️ Back to activities", callback_data="ACTLIST|BACK")],
+    ])
 
 def yesno_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -387,6 +426,7 @@ def caregiver_pick_individual_kb(caregiver_handle: str, activity_id: int) -> Inl
     rows = []
     for h, name in people:
         rows.append([InlineKeyboardButton(f"{name} (@{h})", callback_data=f"CGBOOK|{activity_id}|{h}")])
+    rows.append([InlineKeyboardButton("⬅️ Back to activities", callback_data="ACTLIST|BACK")])
     return InlineKeyboardMarkup(rows)
 
 def caregiver_confirm_kb(activity_id: int, individual_handle: str) -> InlineKeyboardMarkup:
@@ -395,6 +435,20 @@ def caregiver_confirm_kb(activity_id: int, individual_handle: str) -> InlineKeyb
             InlineKeyboardButton("✅ Confirm", callback_data=f"CGCONF|{activity_id}|{individual_handle}|YES"),
             InlineKeyboardButton("❌ Decline", callback_data=f"CGCONF|{activity_id}|{individual_handle}|NO"),
         ]
+    ])
+
+# ✅ Month buttons grid (2 per row) + back button
+def admin_months_kb(keys: List[str]) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(month_label(k), callback_data=f"ADM_MONTH|{k}") for k in keys]
+    rows = []
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i+2])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ADM_MONTHS|BACK")])
+    return InlineKeyboardMarkup(rows)
+
+def admin_back_to_months_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to months", callback_data="ADM_MONTHS|LIST")]
     ])
 
 # ------------------------
@@ -423,13 +477,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     awaiting = context.user_data.get("awaiting")
     chat_id = update.effective_chat.id
 
-    # Back
     if text == "⬅️ Back":
         context.user_data.clear()
         await update.message.reply_text("Menu:", reply_markup=main_menu_keyboard())
         return
 
-    # ✅ REQUIRED FIX: handle REG_ROLE *before* wizard routing, match by keyword (emoji safe)
+    # Role selection (emoji-safe) BEFORE wizard routing
     if context.user_data.get("awaiting") == "REG_ROLE":
         lower = text.lower()
         if "individual" in lower:
@@ -445,12 +498,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Type your full name (one time):", reply_markup=main_menu_keyboard())
         return
 
-    # Wizard routing
     if awaiting:
         await handle_wizard_text(update, context)
         return
 
-    # Main menu actions
     if text == "📝 Register / Update Profile":
         context.user_data["awaiting"] = "REG_ROLE"
         await update.message.reply_text("Choose role:", reply_markup=register_role_keyboard())
@@ -465,8 +516,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not acts:
             await update.message.reply_text("No activities available.", reply_markup=main_menu_keyboard())
             return
-        await update.message.reply_text("Activities (tap Details or Book):", reply_markup=main_menu_keyboard())
-        await update.message.reply_text("Select:", reply_markup=activities_inline_kb(acts))
+        await update.message.reply_text("Select an activity to view details:", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Activities:", reply_markup=activities_name_list_kb(acts))
         return
 
     if text == "✅ My Bookings":
@@ -487,7 +538,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cg_part = ""
             if cg:
                 cg_part = f" | caregiver @{cg} ({cg_status})"
-            lines.append(f"- #{act_id} {title} ({fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))}){cg_part}")
+            lines.append(f"- #{act_id} {title} ({fmt_dt(int(s))}-{fmt_time(int(e))}){cg_part}")
         await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
         return
 
@@ -516,7 +567,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             out.append("- (none)")
         else:
             for name, ih, title, s, e, status, act_id in with_me:
-                out.append(f"- #{act_id} {title} | {name} (@{ih}) | {fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))} | {status}")
+                out.append(f"- #{act_id} {title} | {name} (@{ih}) | {fmt_dt(int(s))}-{fmt_time(int(e))} | {status}")
 
         out.append("")
         out.append("Events your linked individuals are attending without you:")
@@ -524,7 +575,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             out.append("- (none)")
         else:
             for name, ih, title, s, e, act_id in without_me:
-                out.append(f"- #{act_id} {title} | {name} (@{ih}) | {fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))}")
+                out.append(f"- #{act_id} {title} | {name} (@{ih}) | {fmt_dt(int(s))}-{fmt_time(int(e))}")
 
         await update.message.reply_text("\n".join(out), reply_markup=main_menu_keyboard())
         return
@@ -552,6 +603,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Event title:", reply_markup=admin_panel_keyboard())
         return
 
+    if text == "📆 View Events by Month":
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await update.message.reply_text("Not authorised.", reply_markup=main_menu_keyboard())
+            return
+        keys = list_upcoming_month_keys()
+        if not keys:
+            await update.message.reply_text("No upcoming events.", reply_markup=admin_panel_keyboard())
+            return
+        await update.message.reply_text("Select a month:", reply_markup=admin_panel_keyboard())
+        await update.message.reply_text("Months:", reply_markup=admin_months_kb(keys))
+        return
+
     await update.message.reply_text("Use /start and the menu buttons.", reply_markup=main_menu_keyboard())
 
 async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -561,7 +625,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     awaiting = context.user_data.get("awaiting")
     tmp = context.user_data.get("tmp", {})
 
-    # Admin password
     if awaiting == "ADMIN_PASSWORD":
         if msg == ADMIN_PASSWORD:
             existing = user_get(handle)
@@ -577,7 +640,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("Wrong password.", reply_markup=main_menu_keyboard())
         return
 
-    # Register name
     if awaiting == "REG_NAME":
         tmp["full_name"] = msg
         context.user_data["tmp"] = tmp
@@ -585,7 +647,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Type phone number (or '-' to skip):", reply_markup=main_menu_keyboard())
         return
 
-    # Register phone
     if awaiting == "REG_PHONE":
         phone = "" if msg == "-" else msg
         role = tmp.get("role", "individual")
@@ -599,7 +660,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("Registration complete.", reply_markup=main_menu_keyboard())
             return
 
-        # Caregiver: prompt first individual name + handle
         if role == "caregiver":
             context.user_data["awaiting"] = "CG_FIRST_NAME"
             context.user_data["tmp"] = {"role": role, "full_name": full_name, "phone": phone}
@@ -625,7 +685,6 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # Cancel booking
     if awaiting == "CANCEL_ACT_ID":
         u = user_get(handle)
         if not u or u[1] != "individual":
@@ -727,7 +786,7 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         act = activity_get(activity_id)
         title = act[1] if act else f"Activity #{activity_id}"
         s = fmt_dt(act[4]) if act else ""
-        e = time.strftime('%H:%M', time.localtime(int(act[5]))) if act else ""
+        e = fmt_time(act[5]) if act else ""
 
         await context.bot.send_message(
             chat_id=cg_user[4],
@@ -776,7 +835,18 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = data.split("|")
     action = parts[0]
 
-    if action == "DETAILS":
+    # Back to activity list
+    if action == "ACTLIST":
+        acts = list_activities()
+        if not acts:
+            await q.edit_message_text("No activities available.")
+            return
+        await q.edit_message_text("Select an activity to view details:")
+        await q.message.reply_text("Activities:", reply_markup=activities_name_list_kb(acts))
+        return
+
+    # Activity details view
+    if action == "ACT":
         act_id = int(parts[1])
         act = activity_get(act_id)
         if not act:
@@ -785,14 +855,44 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, title, desc, loc, s, e, cap, booked = act
         text = (
             f"#{act_id} — {title}\n"
-            f"🕒 {fmt_dt(int(s))}–{time.strftime('%H:%M', time.localtime(int(e)))}\n"
+            f"🕒 {fmt_dt(int(s))}–{fmt_time(int(e))}\n"
             f"📍 {loc or '-'}\n"
             f"📝 {desc or '-'}\n"
             f"👥 {booked}/{cap}"
         )
-        await q.edit_message_text(text)
+        await q.edit_message_text(text, reply_markup=activity_detail_kb(act_id))
         return
 
+    # ✅ Back/list months callbacks
+    if action == "ADM_MONTHS":
+        cmd = parts[1] if len(parts) > 1 else "LIST"
+        if cmd in ("LIST", "BACK"):
+            keys = list_upcoming_month_keys()
+            if not keys:
+                await q.edit_message_text("No upcoming events.")
+                return
+            await q.edit_message_text("Select a month:")
+            await q.message.reply_text("Months:", reply_markup=admin_months_kb(keys))
+            return
+
+    # Admin month selection => list events + back button
+    if action == "ADM_MONTH":
+        month = parts[1]  # YYYY-MM
+        acts = activities_in_month(month)
+        if not acts:
+            await q.edit_message_text(f"No events for {month_label(month)}.", reply_markup=admin_back_to_months_kb())
+            return
+
+        lines = [f"Events in {month_label(month)}:"]
+        for a in acts:
+            act_id, title, _, loc, s, e, cap, booked = a
+            lines.append(
+                f"- #{act_id} {title} | {fmt_dt(int(s))}-{fmt_time(int(e))} | {loc or '-'} | {booked}/{cap}"
+            )
+        await q.edit_message_text("\n".join(lines), reply_markup=admin_back_to_months_kb())
+        return
+
+    # Booking routes by role
     if action == "BOOK":
         act_id = int(parts[1])
         u = user_get(handle)
@@ -808,7 +908,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await q.edit_message_text(msg)
                 return
 
-            # Ask caregiver joining?
             context.user_data["tmp"] = {"activity_id": act_id, "individual_handle": ind_handle}
             await q.edit_message_text("Will your caregiver be joining?", reply_markup=yesno_kb("INDCG"))
             return
@@ -833,8 +932,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data.clear()
             await q.edit_message_text("Booked (no caregiver).")
             return
-
-        # YES -> ask caregiver handle via normal message
         context.user_data["awaiting"] = "IND_CG_HANDLE"
         await q.edit_message_text("Type your caregiver’s Telegram handle (e.g., @caregiver123):")
         return
@@ -842,10 +939,12 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "CGBOOK":
         act_id = int(parts[1])
         ind_handle = norm_handle(parts[2])
+
         linked = {h for h, _ in caregiver_linked_individuals(handle)}
         if ind_handle not in linked:
             await q.edit_message_text("You can only book for individuals linked to your caregiver account.")
             return
+
         ok, msg = create_booking(act_id, ind_handle, handle, None, None)
         await q.edit_message_text(msg)
         return
