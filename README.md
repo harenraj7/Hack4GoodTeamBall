@@ -1,4 +1,5 @@
 # MINDS Booking System (Telegram Bot) — Hack4Good
+Problem Statement 3
 
 Telegram bot to reduce friction in activity sign-ups for individuals and caregivers, while reducing admin effort to manage registrations.
 
