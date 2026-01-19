@@ -673,7 +673,7 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Type phone number (or '-' to skip):", reply_markup=main_menu_keyboard())
         return
 
-        if awaiting == "ADM_ATTEND_ID":
+    if awaiting == "ADM_ATTEND_ID":
         if not msg.isdigit():
             await update.message.reply_text("Enter a numeric activity id (e.g., 1).")
             return
