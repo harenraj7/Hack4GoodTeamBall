@@ -12,7 +12,7 @@ Telegram bot to reduce friction in activity sign-ups for individuals and caregiv
 - View bookings / attendance
 
 ### Admin
-- Admin login (password-protected)
+- Admin login (password-protected) [Password is admin_password]
 - Create events (title/description/location/time/capacity)
 - View upcoming events by month
 
@@ -21,7 +21,7 @@ Telegram bot to reduce friction in activity sign-ups for individuals and caregiv
 ## Requirements
 - Python 3.10+ recommended
 - Telegram account with a **username** (Settings → Username)
-- A Telegram bot token from **@BotFather**
+- A Telegram bot token from **@BotFather** [Token is 8474153804:AAG3Tq3ViHmNr-ftoI3jra_hljsUxHVq3hk]
 
 ---
 
