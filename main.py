@@ -150,6 +150,26 @@ def user_get(handle: str) -> Optional[Tuple]:
             (handle,),
         ).fetchone()
 
+def admin_attendance_list(activity_id: int) -> List[Tuple]:
+    """
+    Returns rows: (individual_name, individual_handle, caregiver_handle, caregiver_status, booked_by_handle, created_ts)
+    Sorted by individual_name.
+    """
+    with db() as conn:
+        return conn.execute("""
+            SELECT p.name,
+                   b.individual_handle,
+                   b.caregiver_handle,
+                   b.caregiver_status,
+                   b.booked_by_handle,
+                   b.created_ts
+            FROM bookings b
+            JOIN individual_profiles p ON p.handle=b.individual_handle
+            WHERE b.activity_id=?
+            ORDER BY LOWER(p.name) ASC, b.individual_handle ASC;
+        """, (int(activity_id),)).fetchall()
+
+
 def user_upsert(handle: str, role: str, full_name: str, phone: str, chat_id: Optional[int]) -> None:
     with db() as conn:
         conn.execute("""
@@ -394,6 +414,7 @@ def admin_panel_keyboard() -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton("➕ Add Event")],
         [KeyboardButton("📆 View Events by Month")],
+        [KeyboardButton("📋 Attendance List")],
         [KeyboardButton("⬅️ Back")],
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -515,6 +536,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Activities:", reply_markup=activities_name_list_kb(acts))
         return
 
+    if text == "📋 Attendance List":
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await update.message.reply_text("Not authorised.", reply_markup=main_menu_keyboard())
+            return
+        context.user_data["awaiting"] = "ADM_ATTEND_ID"
+        await update.message.reply_text("Enter activity id to generate attendance list (e.g., 1):", reply_markup=admin_panel_keyboard())
+        return
+
+    
     if text == "✅ My Bookings":
         u = user_get(handle)
         if not u:
@@ -642,6 +673,43 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Type phone number (or '-' to skip):", reply_markup=main_menu_keyboard())
         return
 
+        if awaiting == "ADM_ATTEND_ID":
+        if not msg.isdigit():
+            await update.message.reply_text("Enter a numeric activity id (e.g., 1).")
+            return
+
+        act_id = int(msg)
+        act = activity_get(act_id)
+        if not act:
+            context.user_data.clear()
+            await update.message.reply_text("Activity not found.", reply_markup=main_menu_keyboard())
+            return
+
+        rows = admin_attendance_list(act_id)
+        title = act[1]
+        s = fmt_dt(int(act[4]))
+        e = fmt_time(int(act[5]))
+
+        if not rows:
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"Attendance list for #{act_id} {title}\n🕒 {s}-{e}\n\n(no attendees yet)",
+                reply_markup=main_menu_keyboard()
+            )
+            return
+
+        lines = [f"Attendance list for #{act_id} {title}", f"🕒 {s}-{e}", ""]
+        for name, ind_h, cg_h, cg_status, booked_by, created_ts in rows:
+            cg_part = ""
+            if cg_h:
+                cg_part = f" | caregiver @{cg_h} ({cg_status})"
+            lines.append(f"- {name} (@{ind_h}){cg_part}")
+
+        context.user_data.clear()
+        await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
+        return
+
+    
     if awaiting == "REG_PHONE":
         phone = "" if msg == "-" else msg
         role = tmp.get("role", "individual")
