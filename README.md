@@ -70,7 +70,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-### 3) 
+### 3) [Replace 'PASTE_TOKEN_HERE' with bot token created via **@BotFather**]
 export BOT_TOKEN='PASTE_TOKEN_HERE' 
 python main.py
 
