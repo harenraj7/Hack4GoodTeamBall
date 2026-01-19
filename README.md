@@ -22,7 +22,7 @@ Telegram bot to reduce friction in activity sign-ups for individuals and caregiv
 ## Requirements
 - Python 3.10+ recommended
 - Telegram account with a **username** (Settings → Username)
-- A Telegram bot token from **@BotFather** [Token is 8474153804:AAG3Tq3ViHmNr-ftoI3jra_hljsUxHVq3hk]
+- A Telegram bot token from **@BotFather**
 
 ---
 
@@ -30,5 +30,5 @@ Telegram bot to reduce friction in activity sign-ups for individuals and caregiv
 
 ### 1) Clone the repo
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
+git clone https://github.com/harenraj7/Hack4GoodTeamBall.git
 cd <YOUR_REPO>
