@@ -46,7 +46,7 @@ def get_handle(update: Update) -> Optional[str]:
     return u.username.lower()
 
 def norm_handle(s: str) -> str:
-    s = s.strip()
+    s = (s or "").strip()
     if s.startswith("@"):
         s = s[1:]
     return s.lower()
@@ -71,9 +71,9 @@ def init_db() -> None:
             chat_id INTEGER
         );
 
-        -- Individuals under care. These can be "profiles" even if they don't run the bot.
+        -- Individuals under care (may exist even if they don't run the bot)
         CREATE TABLE IF NOT EXISTS individual_profiles (
-            handle TEXT PRIMARY KEY,           -- telehandle of the individual
+            handle TEXT PRIMARY KEY,     -- telehandle of the individual
             name TEXT NOT NULL,
             created_ts INTEGER NOT NULL
         );
@@ -180,7 +180,7 @@ def caregiver_link_add(caregiver_handle: str, individual_handle: str) -> None:
         conn.execute("""
             INSERT OR IGNORE INTO caregiver_links(caregiver_handle, individual_handle)
             VALUES (?,?);
-        """, (caregiver_handle, norm_handle(individual_handle)))
+        """, (norm_handle(caregiver_handle), norm_handle(individual_handle)))
 
 def caregiver_linked_individuals(caregiver_handle: str) -> List[Tuple[str, str]]:
     with db() as conn:
@@ -190,19 +190,16 @@ def caregiver_linked_individuals(caregiver_handle: str) -> List[Tuple[str, str]]
             JOIN individual_profiles p ON p.handle=l.individual_handle
             WHERE l.caregiver_handle=?
             ORDER BY p.name ASC;
-        """, (caregiver_handle,)).fetchall()
+        """, (norm_handle(caregiver_handle),)).fetchall()
         return [(r[0], r[1]) for r in rows]
 
 def ensure_self_individual_profile(handle: str, name_fallback: str) -> str:
-    """
-    For role=individual (bot user), their 'individual_profile' is their own telehandle.
-    """
     h = norm_handle(handle)
     with db() as conn:
         row = conn.execute("SELECT handle FROM individual_profiles WHERE handle=?;", (h,)).fetchone()
         if row:
             return h
-    individual_profile_upsert(h, name_fallback)
+    individual_profile_upsert(h, name_fallback or h)
     return h
 
 def list_activities() -> List[Tuple]:
@@ -220,7 +217,7 @@ def activity_get(act_id: int) -> Optional[Tuple]:
             SELECT id, title, description, location, start_ts, end_ts, capacity,
                    (SELECT COUNT(*) FROM bookings b WHERE b.activity_id=activities.id) AS booked
             FROM activities WHERE id=?;
-        """, (act_id,)).fetchone()
+        """, (int(act_id),)).fetchone()
 
 def capacity_available(act_id: int) -> bool:
     row = activity_get(act_id)
@@ -230,9 +227,6 @@ def capacity_available(act_id: int) -> bool:
     return booked < cap
 
 def booking_conflict(individual_handle: str, act_id: int) -> Optional[str]:
-    """
-    Overlap check: existing.start < new.end AND new.start < existing.end
-    """
     row = activity_get(act_id)
     if not row:
         return "Activity not found."
@@ -279,6 +273,14 @@ def create_booking(activity_id: int, individual_handle: str, booked_by: str,
         except sqlite3.IntegrityError:
             return False, "Already booked."
 
+def update_booking_caregiver(activity_id: int, individual_handle: str, caregiver_handle: str) -> None:
+    with db() as conn:
+        conn.execute("""
+            UPDATE bookings
+            SET caregiver_handle=?, caregiver_status='pending'
+            WHERE activity_id=? AND individual_handle=?;
+        """, (norm_handle(caregiver_handle), int(activity_id), norm_handle(individual_handle)))
+
 def update_caregiver_status(activity_id: int, individual_handle: str, caregiver_handle: str, status: str) -> None:
     with db() as conn:
         conn.execute("""
@@ -305,11 +307,6 @@ def cancel_booking(activity_id: int, individual_handle: str) -> bool:
         return cur.rowcount > 0
 
 def caregiver_view_attendance(caregiver_handle: str) -> Tuple[List[Tuple], List[Tuple]]:
-    """
-    Returns:
-      - with_me: bookings where caregiver_handle matches and caregiver_status confirmed/pending
-      - without_me: bookings for linked individuals where caregiver_handle is null OR declined
-    """
     caregiver_handle = norm_handle(caregiver_handle)
     with db() as conn:
         with_me = conn.execute("""
@@ -401,7 +398,7 @@ def caregiver_confirm_kb(activity_id: int, individual_handle: str) -> InlineKeyb
     ])
 
 # ------------------------
-# Bot handlers
+# Handlers
 # ------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -410,7 +407,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Set a Telegram username first (Settings → Username), then /start again.")
         return
 
-    # store chat_id if user exists (or later upon register/login)
     chat_id = update.effective_chat.id
     if user_get(handle):
         user_set_chat_id(handle, chat_id)
@@ -425,7 +421,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     text = (update.message.text or "").strip()
     awaiting = context.user_data.get("awaiting")
-    tmp = context.user_data.get("tmp", {})
+    chat_id = update.effective_chat.id
 
     # Back
     if text == "⬅️ Back":
@@ -433,12 +429,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Menu:", reply_markup=main_menu_keyboard())
         return
 
+    # ✅ REQUIRED FIX: handle REG_ROLE *before* wizard routing, match by keyword (emoji safe)
+    if context.user_data.get("awaiting") == "REG_ROLE":
+        lower = text.lower()
+        if "individual" in lower:
+            role = "individual"
+        elif "caregiver" in lower:
+            role = "caregiver"
+        else:
+            await update.message.reply_text("Choose role:", reply_markup=register_role_keyboard())
+            return
+
+        context.user_data["tmp"] = {"role": role}
+        context.user_data["awaiting"] = "REG_NAME"
+        await update.message.reply_text("Type your full name (one time):", reply_markup=main_menu_keyboard())
+        return
+
     # Wizard routing
     if awaiting:
         await handle_wizard_text(update, context)
         return
 
-    # Main menu
+    # Main menu actions
     if text == "📝 Register / Update Profile":
         context.user_data["awaiting"] = "REG_ROLE"
         await update.message.reply_text("Choose role:", reply_markup=register_role_keyboard())
@@ -540,18 +552,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Event title:", reply_markup=admin_panel_keyboard())
         return
 
-    # registration role choice (reply buttons)
-    if text in ("🙋 Individual", "🧑‍🦽 Caregiver"):
-        if context.user_data.get("awaiting") != "REG_ROLE":
-            await update.message.reply_text("Use Register to begin.", reply_markup=main_menu_keyboard())
-            return
-
-        role = "individual" if text.startswith("🙋") else "caregiver"
-        context.user_data["tmp"] = {"role": role}
-        context.user_data["awaiting"] = "REG_NAME"
-        await update.message.reply_text("Type your full name (one time):", reply_markup=main_menu_keyboard())
-        return
-
     await update.message.reply_text("Use /start and the menu buttons.", reply_markup=main_menu_keyboard())
 
 async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -593,38 +593,31 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         user_upsert(handle, role, full_name, phone, chat_id)
 
-        # Ensure individual profile for individuals (self)
         if role == "individual":
             ensure_self_individual_profile(handle, full_name)
+            context.user_data.clear()
+            await update.message.reply_text("Registration complete.", reply_markup=main_menu_keyboard())
+            return
 
-        # NEW: caregiver registration asks for first individual + telehandle
+        # Caregiver: prompt first individual name + handle
         if role == "caregiver":
             context.user_data["awaiting"] = "CG_FIRST_NAME"
-            context.user_data["tmp"] = {"full_name": full_name, "phone": phone, "role": role}
+            context.user_data["tmp"] = {"role": role, "full_name": full_name, "phone": phone}
             await update.message.reply_text("Caregiver setup: What is the individual's name under your care?", reply_markup=main_menu_keyboard())
             return
 
-        # done for individual
-        context.user_data.clear()
-        await update.message.reply_text("Registration complete.", reply_markup=main_menu_keyboard())
-        return
-
-    # Caregiver first individual name
     if awaiting == "CG_FIRST_NAME":
         tmp["ind_name"] = msg
         context.user_data["tmp"] = tmp
         context.user_data["awaiting"] = "CG_FIRST_HANDLE"
-        await update.message.reply_text("What is the individual's Telegram handle? (e.g., @john123 or john123)")
+        await update.message.reply_text("What is the individual's Telegram handle? (e.g., @john123)")
         return
 
-    # Caregiver first individual handle
     if awaiting == "CG_FIRST_HANDLE":
         ind_handle = norm_handle(msg)
         ind_name = tmp.get("ind_name", "Individual")
-
         individual_profile_upsert(ind_handle, ind_name)
         caregiver_link_add(handle, ind_handle)
-
         context.user_data.clear()
         await update.message.reply_text(
             f"Caregiver registration complete.\nLinked individual: {ind_name} (@{ind_handle}).\n\nTo add more later: /add_individual",
@@ -649,7 +642,7 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Cancelled." if ok else "No such booking.", reply_markup=main_menu_keyboard())
         return
 
-    # Admin add event wizard (details + timing + capacity)
+    # Admin add event wizard
     if awaiting == "ADM_TITLE":
         tmp["title"] = msg
         context.user_data["tmp"] = tmp
@@ -713,22 +706,14 @@ async def handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Event created: #{act_id}", reply_markup=main_menu_keyboard())
         return
 
-    # Individual booking flow: waiting caregiver handle
+    # Individual booking: caregiver handle
     if awaiting == "IND_CG_HANDLE":
-        # tmp: {activity_id, individual_handle}
         cg_handle = norm_handle(msg)
         activity_id = int(tmp["activity_id"])
         individual_handle = tmp["individual_handle"]
 
-        # Update booking with caregiver pending (booking already created without caregiver)
-        with db() as conn:
-            conn.execute("""
-                UPDATE bookings
-                SET caregiver_handle=?, caregiver_status='pending'
-                WHERE activity_id=? AND individual_handle=?;
-            """, (cg_handle, activity_id, norm_handle(individual_handle)))
+        update_booking_caregiver(activity_id, individual_handle, cg_handle)
 
-        # Try to notify caregiver
         cg_user = user_get(cg_handle)
         if not cg_user or not cg_user[4]:
             context.user_data.clear()
@@ -791,7 +776,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = data.split("|")
     action = parts[0]
 
-    # Details
     if action == "DETAILS":
         act_id = int(parts[1])
         act = activity_get(act_id)
@@ -809,7 +793,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text(text)
         return
 
-    # Book (routes based on role)
     if action == "BOOK":
         act_id = int(parts[1])
         u = user_get(handle)
@@ -825,7 +808,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await q.edit_message_text(msg)
                 return
 
-            # Ask if caregiver joining
+            # Ask caregiver joining?
             context.user_data["tmp"] = {"activity_id": act_id, "individual_handle": ind_handle}
             await q.edit_message_text("Will your caregiver be joining?", reply_markup=yesno_kb("INDCG"))
             return
@@ -844,48 +827,35 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text("Admins cannot book as users.")
         return
 
-    # Individual caregiver-join answer
     if action == "INDCG":
         yn = parts[1]
-        tmp = context.user_data.get("tmp", {})
-        act_id = int(tmp.get("activity_id", -1))
-        ind_handle = tmp.get("individual_handle")
-
         if yn == "NO":
             context.user_data.clear()
             await q.edit_message_text("Booked (no caregiver).")
             return
 
-        # YES -> ask for caregiver handle in chat
+        # YES -> ask caregiver handle via normal message
         context.user_data["awaiting"] = "IND_CG_HANDLE"
         await q.edit_message_text("Type your caregiver’s Telegram handle (e.g., @caregiver123):")
         return
 
-    # Caregiver book for chosen linked individual
     if action == "CGBOOK":
         act_id = int(parts[1])
         ind_handle = norm_handle(parts[2])
-
-        # enforce linked
         linked = {h for h, _ in caregiver_linked_individuals(handle)}
         if ind_handle not in linked:
             await q.edit_message_text("You can only book for individuals linked to your caregiver account.")
             return
-
         ok, msg = create_booking(act_id, ind_handle, handle, None, None)
         await q.edit_message_text(msg)
         return
 
-    # Caregiver confirms attendance request
     if action == "CGCONF":
         act_id = int(parts[1])
         ind_handle = norm_handle(parts[2])
         yn = parts[3]
         status = "confirmed" if yn == "YES" else "declined"
-
-        # Update only if caregiver_handle matches current user
         update_caregiver_status(act_id, ind_handle, handle, status)
-
         await q.edit_message_text("Recorded: " + ("Confirmed ✅" if status == "confirmed" else "Declined ❌"))
         return
 
