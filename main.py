@@ -1,10 +1,11 @@
-import os
 import sqlite3
 import time
 from typing import Optional, List, Tuple
 
 from telegram import (
     Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -18,53 +19,33 @@ from telegram.ext import (
 )
 
 DB_PATH = "bot.db"
+ADMIN_PASSWORD = "admin_password"  # per your requirement
 
-# -----------------------
-# Utilities
-# -----------------------
+# ---------- Time helpers ----------
 
 def now_ts() -> int:
     return int(time.time())
 
+def fmt_dt(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+
+def parse_local_dt(s: str) -> Optional[int]:
+    """Parse 'YYYY-MM-DD HH:MM' in local time."""
+    try:
+        t = time.strptime(s.strip(), "%Y-%m-%d %H:%M")
+        return int(time.mktime(t))
+    except Exception:
+        return None
+
+# ---------- Telegram helpers ----------
+
 def get_handle(update: Update) -> Optional[str]:
-    """Telegram username (without @). Required as PK per your spec."""
     u = update.effective_user
     if not u or not u.username:
         return None
     return u.username.lower()
 
-def parse_local_datetime_to_ts(s: str) -> Optional[int]:
-    """
-    Parse 'YYYY-MM-DD HH:MM' into local unix timestamp.
-    Example: '2026-01-19 14:30'
-    """
-    try:
-        tup = time.strptime(s.strip(), "%Y-%m-%d %H:%M")
-        return int(time.mktime(tup))  # local time
-    except Exception:
-        return None
-
-def fmt_dt(ts: int) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
-
-def is_admin(handle: str) -> bool:
-    u = user_get(handle)
-    if not u:
-        return False
-    return u[1] == "admin"  # role
-
-def fmt_activity_row(row: Tuple) -> str:
-    # (id, title, start_ts, end_ts, capacity, booked_count)
-    act_id, title, start_ts, end_ts, capacity, booked = row
-    return (
-        f"#{act_id} — {title}\n"
-        f"🕒 {fmt_dt(int(start_ts))}–{time.strftime('%H:%M', time.localtime(int(end_ts)))}\n"
-        f"👥 {booked}/{capacity}"
-    )
-
-# -----------------------
-# DB Layer
-# -----------------------
+# ---------- DB ----------
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -85,7 +66,6 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             caregiver_handle TEXT NOT NULL,
             name TEXT NOT NULL,
-            nric_last4 TEXT,
             FOREIGN KEY (caregiver_handle) REFERENCES users(handle) ON DELETE CASCADE
         );
 
@@ -118,8 +98,8 @@ def seed_demo_activities_if_empty() -> None:
         base = now_ts() + 3600
         demo = [
             ("Music Therapy", base, base + 3600, 10),
-            ("Physio Session", base + 1800, base + 5400, 5),   # overlaps with first
-            ("Art Jam", base + 5400, base + 7200, 8),          # later
+            ("Physio Session", base + 1800, base + 5400, 5),
+            ("Art Jam", base + 5400, base + 7200, 8),
         ]
         conn.executemany(
             "INSERT INTO activities(title,start_ts,end_ts,capacity) VALUES (?,?,?,?);",
@@ -148,33 +128,14 @@ def user_set_role(handle: str, role: str) -> None:
     with db() as conn:
         conn.execute("UPDATE users SET role=? WHERE handle=?;", (role, handle))
 
-def caregiver_add_individual(caregiver_handle: str, name: str) -> int:
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO individuals(caregiver_handle,name,nric_last4) VALUES (?,?,NULL);",
-            (caregiver_handle, name.strip()),
-        )
-        return int(cur.lastrowid)
-
-def caregiver_list_individuals(caregiver_handle: str) -> List[Tuple[int, str]]:
-    with db() as conn:
-        cur = conn.execute(
-            "SELECT id, name FROM individuals WHERE caregiver_handle=? ORDER BY id;",
-            (caregiver_handle,),
-        )
-        return [(int(r[0]), r[1]) for r in cur.fetchall()]
-
-def individual_get_for_handle(handle: str) -> Optional[int]:
+def individual_get_or_create_for_individual_user(handle: str) -> Optional[int]:
     """
-    If role=individual, ensure a corresponding individuals row exists:
-    we store it as caregiver_handle = handle.
+    For role=individual, we create exactly one 'individuals' row where caregiver_handle == handle.
     """
     u = user_get(handle)
-    if not u:
+    if not u or u[1] != "individual":
         return None
-    _, role, full_name, _ = u
-    if role != "individual":
-        return None
+    full_name = u[2] or handle
 
     with db() as conn:
         row = conn.execute(
@@ -185,68 +146,79 @@ def individual_get_for_handle(handle: str) -> Optional[int]:
             return int(row[0])
 
         cur = conn.execute(
-            "INSERT INTO individuals(caregiver_handle,name,nric_last4) VALUES (?,?,NULL);",
-            (handle, full_name or handle),
+            "INSERT INTO individuals(caregiver_handle,name) VALUES (?,?);",
+            (handle, full_name),
         )
         return int(cur.lastrowid)
 
-def list_activities() -> List[Tuple]:
-    # Enforced soonest-first ordering by start_ts ASC
+def caregiver_add_person(caregiver_handle: str, name: str) -> int:
     with db() as conn:
-        cur = conn.execute("""
+        cur = conn.execute(
+            "INSERT INTO individuals(caregiver_handle,name) VALUES (?,?);",
+            (caregiver_handle, name.strip()),
+        )
+        return int(cur.lastrowid)
+
+def caregiver_list_people(caregiver_handle: str) -> List[Tuple[int, str]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name FROM individuals WHERE caregiver_handle=? ORDER BY id;",
+            (caregiver_handle,),
+        ).fetchall()
+        return [(int(r[0]), r[1]) for r in rows]
+
+def list_activities() -> List[Tuple]:
+    # soonest first
+    with db() as conn:
+        return conn.execute("""
             SELECT a.id, a.title, a.start_ts, a.end_ts, a.capacity,
-                   (SELECT COUNT(*) FROM bookings b WHERE b.activity_id=a.id) AS booked_count
+                   (SELECT COUNT(*) FROM bookings b WHERE b.activity_id=a.id)
             FROM activities a
             ORDER BY a.start_ts ASC, a.id ASC;
-        """)
-        return cur.fetchall()
-
-def activity_exists(activity_id: int) -> bool:
-    with db() as conn:
-        return conn.execute("SELECT 1 FROM activities WHERE id=?;", (activity_id,)).fetchone() is not None
+        """).fetchall()
 
 def capacity_available(activity_id: int) -> bool:
     with db() as conn:
         row = conn.execute("""
             SELECT a.capacity,
                    (SELECT COUNT(*) FROM bookings b WHERE b.activity_id=a.id) AS booked
-            FROM activities a WHERE a.id=?;
+            FROM activities a
+            WHERE a.id=?;
         """, (activity_id,)).fetchone()
         if not row:
             return False
         cap, booked = int(row[0]), int(row[1])
         return booked < cap
 
-def booking_conflicts(individual_id: int, new_activity_id: int) -> Optional[str]:
-    """Overlap: existing.start < new.end AND new.start < existing.end."""
+def booking_conflict(individual_id: int, activity_id: int) -> Optional[str]:
     with db() as conn:
         row = conn.execute(
-            "SELECT start_ts, end_ts FROM activities WHERE id=?;",
-            (new_activity_id,),
+            "SELECT start_ts, end_ts, title FROM activities WHERE id=?;",
+            (activity_id,),
         ).fetchone()
         if not row:
             return "Activity not found."
-        new_start, new_end = int(row[0]), int(row[1])
+        new_start, new_end, _ = int(row[0]), int(row[1]), row[2]
 
         hit = conn.execute("""
-            SELECT a.id, a.title, a.start_ts, a.end_ts
+            SELECT a.title, a.start_ts, a.end_ts
             FROM bookings b
             JOIN activities a ON a.id=b.activity_id
             WHERE b.individual_id=?
               AND a.start_ts < ?
-              AND ? < a.end_ts;
+              AND ? < a.end_ts
+            LIMIT 1;
         """, (individual_id, new_end, new_start)).fetchone()
 
         if not hit:
             return None
-
-        _, title, s, e = hit
-        return f"Conflicts with: {title} ({fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))})"
+        title, s, e = hit
+        return f"Conflicts with {title} ({fmt_dt(int(s))}-{time.strftime('%H:%M', time.localtime(int(e)))})"
 
 def create_booking(activity_id: int, individual_id: int, booked_by_handle: str) -> Tuple[bool, str]:
     if not capacity_available(activity_id):
         return False, "Activity is full."
-    conflict = booking_conflicts(individual_id, activity_id)
+    conflict = booking_conflict(individual_id, activity_id)
     if conflict:
         return False, conflict
 
@@ -260,6 +232,16 @@ def create_booking(activity_id: int, individual_id: int, booked_by_handle: str) 
         except sqlite3.IntegrityError:
             return False, "Already booked."
 
+def list_bookings(individual_id: int) -> List[Tuple]:
+    with db() as conn:
+        return conn.execute("""
+            SELECT a.id, a.title, a.start_ts, a.end_ts
+            FROM bookings b
+            JOIN activities a ON a.id=b.activity_id
+            WHERE b.individual_id=?
+            ORDER BY a.start_ts ASC, a.id ASC;
+        """, (individual_id,)).fetchall()
+
 def cancel_booking(activity_id: int, individual_id: int) -> bool:
     with db() as conn:
         cur = conn.execute(
@@ -268,27 +250,15 @@ def cancel_booking(activity_id: int, individual_id: int) -> bool:
         )
         return cur.rowcount > 0
 
-def list_bookings_for_individual(individual_id: int) -> List[Tuple]:
-    with db() as conn:
-        cur = conn.execute("""
-            SELECT a.id, a.title, a.start_ts, a.end_ts
-            FROM bookings b
-            JOIN activities a ON a.id=b.activity_id
-            WHERE b.individual_id=?
-            ORDER BY a.start_ts ASC, a.id ASC;
-        """, (individual_id,))
-        return cur.fetchall()
-
 def attendee_list(activity_id: int) -> List[Tuple]:
     with db() as conn:
-        cur = conn.execute("""
+        return conn.execute("""
             SELECT i.name, i.id, b.booked_by_handle, b.created_ts
             FROM bookings b
             JOIN individuals i ON i.id=b.individual_id
             WHERE b.activity_id=?
             ORDER BY i.name ASC;
-        """, (activity_id,))
-        return cur.fetchall()
+        """, (activity_id,)).fetchall()
 
 def admin_add_activity(title: str, start_ts: int, end_ts: int, capacity: int) -> int:
     with db() as conn:
@@ -298,486 +268,406 @@ def admin_add_activity(title: str, start_ts: int, end_ts: int, capacity: int) ->
         )
         return int(cur.lastrowid)
 
-# -----------------------
-# Buttons
-# -----------------------
+# ---------- UI: Reply keyboard (main menu always shows Admin Login) ----------
 
-def main_menu_kb(handle: str) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("📝 Register / Update Profile", callback_data="MENU_REGISTER")],
-        [InlineKeyboardButton("📅 Activities (Book)", callback_data="MENU_ACTIVITIES")],
-        [InlineKeyboardButton("✅ My Bookings", callback_data="MENU_MY")],
-        [InlineKeyboardButton("❌ Cancel Booking", callback_data="MENU_CANCEL")],
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton("📝 Register / Update Profile")],
+        [KeyboardButton("📅 Activities (Book)")],
+        [KeyboardButton("✅ My Bookings"), KeyboardButton("❌ Cancel Booking")],
+        [KeyboardButton("🔐 Admin Login"), KeyboardButton("🛠 Admin Panel")],
     ]
-    if handle and is_admin(handle):
-        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="MENU_ADMIN")])
-    else:
-        rows.append([InlineKeyboardButton("🔐 Admin Login", callback_data="MENU_ADMIN_LOGIN")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def register_role_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton("🙋 Individual"), KeyboardButton("🧑‍🦽 Caregiver")],
+        [KeyboardButton("⬅️ Back")],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def admin_panel_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton("➕ Add Event"), KeyboardButton("📋 Print Namelist")],
+        [KeyboardButton("⬅️ Back")],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+# ---------- UI: Inline keyboards for dynamic lists ----------
+
+def activities_inline_kb(acts: List[Tuple]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"Book #{a[0]} — {a[1]}", callback_data=f"BOOK_ACT|{a[0]}")] for a in acts]
     return InlineKeyboardMarkup(rows)
 
-def register_role_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🙋 Individual", callback_data="REGROLE_individual")],
-        [InlineKeyboardButton("🧑‍🦽 Caregiver", callback_data="REGROLE_caregiver")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="MENU_HOME")],
-    ])
-
-def activities_kb(acts: List[Tuple]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for act_id, title, *_ in acts:
-        rows.append([InlineKeyboardButton(f"Book: #{act_id} {title}", callback_data=f"ACT_{act_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="MENU_HOME")])
+def caregiver_people_inline_kb(people: List[Tuple[int, str]], activity_id: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"{name} (id={pid})", callback_data=f"BOOK_FOR|{activity_id}|{pid}")]
+            for pid, name in people]
     return InlineKeyboardMarkup(rows)
 
-def caregiver_people_kb(people: List[Tuple[int, str]], activity_id: int) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for pid, name in people:
-        rows.append([InlineKeyboardButton(f"{name} (id={pid})", callback_data=f"PICK_{activity_id}_{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="MENU_ACTIVITIES")])
+def cancel_inline_kb(bookings: List[Tuple]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"Cancel #{b[0]} — {b[1]}", callback_data=f"CANCEL|{b[0]}")] for b in bookings]
     return InlineKeyboardMarkup(rows)
 
-def cancel_kb(rows: List[Tuple]) -> InlineKeyboardMarkup:
-    btns: List[List[InlineKeyboardButton]] = []
-    for act_id, title, *_ in rows:
-        btns.append([InlineKeyboardButton(f"Cancel: #{act_id} {title}", callback_data=f"CAN_{act_id}")])
-    btns.append([InlineKeyboardButton("⬅️ Back", callback_data="MENU_HOME")])
-    return InlineKeyboardMarkup(btns)
-
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Event", callback_data="ADMIN_ADD_EVENT")],
-        [InlineKeyboardButton("📋 Print Namelist", callback_data="ADMIN_NAMELIST")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="MENU_HOME")],
-    ])
-
-def admin_events_kb(acts: List[Tuple], prefix: str) -> InlineKeyboardMarkup:
-    # prefix: "ATT" or something
-    rows: List[List[InlineKeyboardButton]] = []
-    for act_id, title, *_ in acts:
-        rows.append([InlineKeyboardButton(f"#{act_id} {title}", callback_data=f"{prefix}_{act_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="MENU_ADMIN")])
+def admin_events_inline_kb(acts: List[Tuple], prefix: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"#{a[0]} — {a[1]}", callback_data=f"{prefix}|{a[0]}")] for a in acts]
     return InlineKeyboardMarkup(rows)
 
-# -----------------------
-# Handlers
-# -----------------------
+# ---------- Bot handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     handle = get_handle(update)
     if not handle:
         await update.message.reply_text(
-            "Please set a Telegram username first (Settings → Username). Then run /start again."
+            "Set a Telegram username first (Settings → Username), then /start again."
         )
         return
+    await update.message.reply_text("Menu:", reply_markup=main_menu_keyboard())
 
-    u = user_get(handle)
-    if not u:
+async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handle = get_handle(update)
+    if not handle:
+        await update.message.reply_text("Set a Telegram username first (Settings → Username).")
+        return
+
+    text = (update.message.text or "").strip()
+
+    # Back buttons
+    if text == "⬅️ Back":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("tmp", None)
+        await update.message.reply_text("Menu:", reply_markup=main_menu_keyboard())
+        return
+
+    # Main menu: Register
+    if text == "📝 Register / Update Profile":
+        context.user_data["awaiting"] = "REG_ROLE"
+        await update.message.reply_text("Choose role:", reply_markup=register_role_keyboard())
+        return
+
+    # Main menu: Activities
+    if text == "📅 Activities (Book)":
+        u = user_get(handle)
+        if not u:
+            await update.message.reply_text("Please register first (tap Register).", reply_markup=main_menu_keyboard())
+            return
+        acts = list_activities()
+        if not acts:
+            await update.message.reply_text("No activities available.", reply_markup=main_menu_keyboard())
+            return
+        msg = "Available activities (soonest first):\n\n" + "\n\n".join(
+            f"#{a[0]} — {a[1]}\n🕒 {fmt_dt(int(a[2]))}–{time.strftime('%H:%M', time.localtime(int(a[3])))}\n👥 {a[5]}/{a[4]}"
+            for a in acts
+        )
+        await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Tap to book:", reply_markup=activities_inline_kb(acts))
+        return
+
+    # Main menu: My bookings
+    if text == "✅ My Bookings":
+        u = user_get(handle)
+        if not u:
+            await update.message.reply_text("Please register first.", reply_markup=main_menu_keyboard())
+            return
+        if u[1] != "individual":
+            await update.message.reply_text("This view is for individuals only (for now).", reply_markup=main_menu_keyboard())
+            return
+        ind_id = individual_get_or_create_for_individual_user(handle)
+        rows = list_bookings(ind_id)
+        if not rows:
+            await update.message.reply_text("No bookings yet.", reply_markup=main_menu_keyboard())
+            return
+        msg = "Your bookings:\n" + "\n".join([f"- #{r[0]} {r[1]}" for r in rows])
+        await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+        return
+
+    # Main menu: Cancel booking
+    if text == "❌ Cancel Booking":
+        u = user_get(handle)
+        if not u:
+            await update.message.reply_text("Please register first.", reply_markup=main_menu_keyboard())
+            return
+        if u[1] != "individual":
+            await update.message.reply_text("Cancel buttons are for individuals only (for now).", reply_markup=main_menu_keyboard())
+            return
+        ind_id = individual_get_or_create_for_individual_user(handle)
+        rows = list_bookings(ind_id)
+        if not rows:
+            await update.message.reply_text("No bookings to cancel.", reply_markup=main_menu_keyboard())
+            return
+        await update.message.reply_text("Tap a booking to cancel:", reply_markup=cancel_inline_kb(rows))
+        return
+
+    # Main menu: Admin login (ALWAYS present)
+    if text == "🔐 Admin Login":
+        context.user_data["awaiting"] = "ADMIN_PASSWORD"
+        await update.message.reply_text("Enter admin password:")
+        return
+
+    # Main menu: Admin panel
+    if text == "🛠 Admin Panel":
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await update.message.reply_text("Not authorised. Tap Admin Login first.", reply_markup=main_menu_keyboard())
+            return
+        await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_keyboard())
+        return
+
+    # Admin Panel options (reply keyboard)
+    if text == "➕ Add Event":
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await update.message.reply_text("Not authorised.", reply_markup=main_menu_keyboard())
+            return
+        context.user_data["awaiting"] = "ADMIN_ADD_TITLE"
+        context.user_data["tmp"] = {}
+        await update.message.reply_text("Event title:", reply_markup=admin_panel_keyboard())
+        return
+
+    if text == "📋 Print Namelist":
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await update.message.reply_text("Not authorised.", reply_markup=main_menu_keyboard())
+            return
+        acts = list_activities()
+        if not acts:
+            await update.message.reply_text("No events available.", reply_markup=admin_panel_keyboard())
+            return
+        await update.message.reply_text("Select event:", reply_markup=admin_events_inline_kb(acts, "NAMELIST"))
+        return
+
+    # Registration role selection (reply)
+    if context.user_data.get("awaiting") == "REG_ROLE":
+        if text not in ("🙋 Individual", "🧑‍🦽 Caregiver"):
+            await update.message.reply_text("Pick a role using the buttons.", reply_markup=register_role_keyboard())
+            return
+        role = "individual" if text.startswith("🙋") else "caregiver"
+        context.user_data["tmp"] = {"role": role}
+        context.user_data["awaiting"] = "REG_NAME"
+        await update.message.reply_text("Type your full name:", reply_markup=main_menu_keyboard())
+        return
+
+    # If user typed something else, route to text wizard handler
+    await handle_wizards(update, context)
+
+async def handle_wizards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handle = get_handle(update)
+    if not handle:
+        return
+    msg = (update.message.text or "").strip()
+    awaiting = context.user_data.get("awaiting")
+    tmp = context.user_data.get("tmp", {})
+
+    # Admin password
+    if awaiting == "ADMIN_PASSWORD":
+        if msg == ADMIN_PASSWORD:
+            if not user_get(handle):
+                user_upsert(handle, "admin", handle, "")
+            else:
+                user_set_role(handle, "admin")
+            context.user_data["awaiting"] = None
+            await update.message.reply_text("Admin access granted. Tap Admin Panel.", reply_markup=main_menu_keyboard())
+        else:
+            context.user_data["awaiting"] = None
+            await update.message.reply_text("Wrong password.", reply_markup=main_menu_keyboard())
+        return
+
+    # Register name
+    if awaiting == "REG_NAME":
+        tmp["full_name"] = msg
+        context.user_data["tmp"] = tmp
+        context.user_data["awaiting"] = "REG_PHONE"
+        await update.message.reply_text("Type phone number (or '-' to skip):", reply_markup=main_menu_keyboard())
+        return
+
+    # Register phone
+    if awaiting == "REG_PHONE":
+        phone = "" if msg == "-" else msg
+        role = tmp.get("role", "individual")
+        full_name = tmp.get("full_name", handle)
+        user_upsert(handle, role, full_name, phone)
+        if role == "individual":
+            individual_get_or_create_for_individual_user(handle)
+        context.user_data["awaiting"] = None
+        context.user_data["tmp"] = {}
+        await update.message.reply_text("Registration complete.", reply_markup=main_menu_keyboard())
+        return
+
+    # Admin add event wizard
+    if awaiting == "ADMIN_ADD_TITLE":
+        tmp["title"] = msg
+        context.user_data["tmp"] = tmp
+        context.user_data["awaiting"] = "ADMIN_ADD_START"
+        await update.message.reply_text("Start datetime (YYYY-MM-DD HH:MM):", reply_markup=admin_panel_keyboard())
+        return
+
+    if awaiting == "ADMIN_ADD_START":
+        ts = parse_local_dt(msg)
+        if ts is None:
+            await update.message.reply_text("Invalid format. Use YYYY-MM-DD HH:MM")
+            return
+        tmp["start_ts"] = ts
+        context.user_data["tmp"] = tmp
+        context.user_data["awaiting"] = "ADMIN_ADD_END"
+        await update.message.reply_text("End datetime (YYYY-MM-DD HH:MM):", reply_markup=admin_panel_keyboard())
+        return
+
+    if awaiting == "ADMIN_ADD_END":
+        ts = parse_local_dt(msg)
+        if ts is None:
+            await update.message.reply_text("Invalid format. Use YYYY-MM-DD HH:MM")
+            return
+        if ts <= int(tmp["start_ts"]):
+            await update.message.reply_text("End must be after start. Enter end datetime again.")
+            return
+        tmp["end_ts"] = ts
+        context.user_data["tmp"] = tmp
+        context.user_data["awaiting"] = "ADMIN_ADD_CAP"
+        await update.message.reply_text("Capacity (positive integer):", reply_markup=admin_panel_keyboard())
+        return
+
+    if awaiting == "ADMIN_ADD_CAP":
+        if not msg.isdigit() or int(msg) <= 0:
+            await update.message.reply_text("Capacity must be a positive integer.")
+            return
+        tmp["capacity"] = int(msg)
+        act_id = admin_add_activity(tmp["title"], tmp["start_ts"], tmp["end_ts"], tmp["capacity"])
+        context.user_data["awaiting"] = None
+        context.user_data["tmp"] = {}
         await update.message.reply_text(
-            "Welcome. Use the menu below to register and book activities.",
-            reply_markup=main_menu_kb(handle),
+            f"Event created: #{act_id}\n{tmp['title']}\n🕒 {fmt_dt(tmp['start_ts'])}–{time.strftime('%H:%M', time.localtime(tmp['end_ts']))}\n👥 cap={tmp['capacity']}",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
-    _, role, full_name, phone = u
-    await update.message.reply_text(
-        f"Logged in as @{handle}\nRole: {role}\nName: {full_name or '-'}\nPhone: {phone or '-'}\n\nMenu:",
-        reply_markup=main_menu_kb(handle),
-    )
+    # Not in a flow
+    await update.message.reply_text("Use /start and the menu buttons.", reply_markup=main_menu_keyboard())
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     handle = get_handle(update)
-    data = q.data or ""
-
     if not handle:
-        await q.edit_message_text("Set a Telegram username first (Settings → Username).")
+        await q.edit_message_text("Set a Telegram username first.")
         return
 
-    # Home
-    if data in ("MENU_HOME",):
-        await q.edit_message_text("Menu:", reply_markup=main_menu_kb(handle))
-        return
+    data = q.data or ""
+    parts = data.split("|")
 
-    # Register
-    if data == "MENU_REGISTER":
-        await q.edit_message_text("Choose your role:", reply_markup=register_role_kb())
-        return
-
-    if data.startswith("REGROLE_"):
-        role = data.split("_", 1)[1]
-        context.user_data["reg_role"] = role
-        context.user_data["awaiting"] = "REG_NAME"
-        await q.edit_message_text("Type your full name (one time):")
-        return
-
-    # Activities
-    if data == "MENU_ACTIVITIES":
-        if not user_get(handle):
-            await q.edit_message_text("Please register first.", reply_markup=main_menu_kb(handle))
-            return
-        acts = list_activities()
-        if not acts:
-            await q.edit_message_text("No activities available.", reply_markup=main_menu_kb(handle))
-            return
-        text = "Available activities (soonest first):\n\n" + "\n\n".join(fmt_activity_row(a) for a in acts)
-        await q.edit_message_text(text, reply_markup=activities_kb(acts))
-        return
-
-    if data.startswith("ACT_"):
+    # Booking flow
+    if parts[0] == "BOOK_ACT":
+        activity_id = int(parts[1])
         u = user_get(handle)
         if not u:
-            await q.edit_message_text("Please register first.", reply_markup=main_menu_kb(handle))
+            await q.edit_message_text("Please register first.")
             return
-        activity_id = int(data.split("_", 1)[1])
-        _, role, *_ = u
 
+        role = u[1]
         if role == "individual":
-            individual_id = individual_get_for_handle(handle)
-            ok, msg = create_booking(activity_id, individual_id, handle)
-            await q.edit_message_text(msg, reply_markup=main_menu_kb(handle))
+            ind_id = individual_get_or_create_for_individual_user(handle)
+            ok, msg = create_booking(activity_id, ind_id, handle)
+            await q.edit_message_text(msg)
             return
 
         if role == "caregiver":
-            people = caregiver_list_individuals(handle)
+            people = caregiver_list_people(handle)
             if not people:
-                await q.edit_message_text(
-                    "No individuals added yet.\nType: /addperson <name> (once) then try again.",
-                    reply_markup=main_menu_kb(handle),
-                )
+                await q.edit_message_text("No individuals added. Use /addperson <name> first.")
                 return
             await q.edit_message_text(
-                "Select who you want to book for:",
-                reply_markup=caregiver_people_kb(people, activity_id),
+                "Select who to book for:",
+                reply_markup=caregiver_people_inline_kb(people, activity_id),
             )
             return
 
-        await q.edit_message_text("Admins should not book as users. Use a normal account.", reply_markup=main_menu_kb(handle))
+        await q.edit_message_text("Admins cannot book as users. Use a normal account.")
         return
 
-    if data.startswith("PICK_"):
+    if parts[0] == "BOOK_FOR":
+        activity_id = int(parts[1])
+        person_id = int(parts[2])
         u = user_get(handle)
         if not u or u[1] != "caregiver":
-            await q.edit_message_text("Only caregivers can do this.", reply_markup=main_menu_kb(handle))
+            await q.edit_message_text("Only caregivers can do this.")
             return
-        _, act_id_str, pid_str = data.split("_")
-        activity_id = int(act_id_str)
-        person_id = int(pid_str)
 
-        owned = {pid for pid, _ in caregiver_list_individuals(handle)}
+        owned = {pid for pid, _ in caregiver_list_people(handle)}
         if person_id not in owned:
-            await q.edit_message_text("That person does not belong to you.", reply_markup=main_menu_kb(handle))
+            await q.edit_message_text("That person does not belong to you.")
             return
 
         ok, msg = create_booking(activity_id, person_id, handle)
-        await q.edit_message_text(msg, reply_markup=main_menu_kb(handle))
+        await q.edit_message_text(msg)
         return
 
-    # My bookings
-    if data == "MENU_MY":
-        u = user_get(handle)
-        if not u:
-            await q.edit_message_text("Please register first.", reply_markup=main_menu_kb(handle))
-            return
-        role = u[1]
-
-        if role == "individual":
-            individual_id = individual_get_for_handle(handle)
-            rows = list_bookings_for_individual(individual_id)
-            if not rows:
-                await q.edit_message_text("No bookings yet.", reply_markup=main_menu_kb(handle))
-                return
-            text = "Your bookings:\n" + "\n".join([f"- #{act_id} {title}" for act_id, title, *_ in rows])
-            await q.edit_message_text(text, reply_markup=main_menu_kb(handle))
-            return
-
-        if role == "caregiver":
-            people = caregiver_list_individuals(handle)
-            if not people:
-                await q.edit_message_text("No individuals added yet. Use /addperson <name>.", reply_markup=main_menu_kb(handle))
-                return
-            lines = ["Caregiver view:\n"]
-            for pid, name in people:
-                rows = list_bookings_for_individual(pid)
-                lines.append(f"{name} (id={pid}):")
-                if not rows:
-                    lines.append("  - (none)")
-                else:
-                    for act_id, title, *_ in rows:
-                        lines.append(f"  - #{act_id} {title}")
-                lines.append("")
-            await q.edit_message_text("\n".join(lines), reply_markup=main_menu_kb(handle))
-            return
-
-        await q.edit_message_text("Admins do not have bookings view.", reply_markup=main_menu_kb(handle))
-        return
-
-    # Cancel
-    if data == "MENU_CANCEL":
-        u = user_get(handle)
-        if not u:
-            await q.edit_message_text("Please register first.", reply_markup=main_menu_kb(handle))
-            return
-        if u[1] != "individual":
-            await q.edit_message_text(
-                "Cancel buttons currently support individuals only.\nCaregivers: /cancelfor <activity_id> <person_id>",
-                reply_markup=main_menu_kb(handle),
-            )
-            return
-        individual_id = individual_get_for_handle(handle)
-        rows = list_bookings_for_individual(individual_id)
-        if not rows:
-            await q.edit_message_text("No bookings to cancel.", reply_markup=main_menu_kb(handle))
-            return
-        await q.edit_message_text("Tap a booking to cancel:", reply_markup=cancel_kb(rows))
-        return
-
-    if data.startswith("CAN_"):
+    # Cancel flow
+    if parts[0] == "CANCEL":
+        activity_id = int(parts[1])
         u = user_get(handle)
         if not u or u[1] != "individual":
-            await q.edit_message_text("Only individuals can cancel via buttons.", reply_markup=main_menu_kb(handle))
+            await q.edit_message_text("Only individuals can cancel via buttons.")
             return
-        activity_id = int(data.split("_", 1)[1])
-        individual_id = individual_get_for_handle(handle)
-        ok = cancel_booking(activity_id, individual_id)
-        await q.edit_message_text("Cancelled." if ok else "No such booking.", reply_markup=main_menu_kb(handle))
+        ind_id = individual_get_or_create_for_individual_user(handle)
+        ok = cancel_booking(activity_id, ind_id)
+        await q.edit_message_text("Cancelled." if ok else "No such booking.")
         return
 
-    # Admin login / panel
-    if data == "MENU_ADMIN_LOGIN":
-        context.user_data["awaiting"] = "ADMIN_PASSWORD"
-        await q.edit_message_text("Enter admin password:")
-        return
+    # Admin namelist
+    if parts[0] == "NAMELIST":
+        activity_id = int(parts[1])
+        u = user_get(handle)
+        if not u or u[1] != "admin":
+            await q.edit_message_text("Not authorised.")
+            return
 
-    if data == "MENU_ADMIN":
-        if not is_admin(handle):
-            await q.edit_message_text("Not authorised. Use Admin Login.", reply_markup=main_menu_kb(handle))
-            return
-        await q.edit_message_text("Admin Panel:", reply_markup=admin_panel_kb())
-        return
-
-    if data == "ADMIN_ADD_EVENT":
-        if not is_admin(handle):
-            await q.edit_message_text("Not authorised.", reply_markup=main_menu_kb(handle))
-            return
-        # Start add-event wizard
-        context.user_data["admin_event"] = {}
-        context.user_data["awaiting"] = "ADMIN_EVENT_TITLE"
-        await q.edit_message_text("Event title:")
-        return
-
-    if data == "ADMIN_NAMELIST":
-        if not is_admin(handle):
-            await q.edit_message_text("Not authorised.", reply_markup=main_menu_kb(handle))
-            return
-        acts = list_activities()
-        if not acts:
-            await q.edit_message_text("No events available.", reply_markup=admin_panel_kb())
-            return
-        await q.edit_message_text(
-            "Select an event to print namelist:",
-            reply_markup=admin_events_kb(acts, prefix="NL"),
-        )
-        return
-
-    if data.startswith("NL_"):
-        if not is_admin(handle):
-            await q.edit_message_text("Not authorised.", reply_markup=main_menu_kb(handle))
-            return
-        activity_id = int(data.split("_", 1)[1])
         rows = attendee_list(activity_id)
         if not rows:
-            await q.edit_message_text("No attendees yet.", reply_markup=admin_panel_kb())
+            await q.edit_message_text("No attendees yet.")
             return
 
         lines = ["name,individual_id,booked_by,created_time"]
         for name, pid, booked_by, created_ts in rows:
             lines.append(f"{name},{pid},@{booked_by},{fmt_dt(int(created_ts))}")
-
-        # Telegram message length limit exists; hackathon approach: send as text
-        await q.edit_message_text("Namelist:\n\n" + "\n".join(lines), reply_markup=admin_panel_kb())
+        await q.edit_message_text("Namelist:\n\n" + "\n".join(lines))
         return
 
-    # Fallback
-    await q.edit_message_text("Menu:", reply_markup=main_menu_kb(handle))
+# ---------- Minimal command fallbacks (caregiver add person) ----------
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Single text handler for:
-    - button-based registration input
-    - admin password input
-    - admin add-event wizard input
-    """
+async def addperson_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     handle = get_handle(update)
     if not handle:
-        await update.message.reply_text("Please set a Telegram username first (Settings → Username).")
+        await update.message.reply_text("Set a Telegram username first.")
         return
-
-    awaiting = context.user_data.get("awaiting")
-    msg = (update.message.text or "").strip()
-
-    # ----- Admin password -----
-    if awaiting == "ADMIN_PASSWORD":
-        admin_pw = os.environ.get("ADMIN_PASSWORD", "")
-        if not admin_pw:
-            await update.message.reply_text(
-                "ADMIN_PASSWORD is not set on the machine running the bot.",
-                reply_markup=main_menu_kb(handle),
-            )
-            context.user_data["awaiting"] = None
-            return
-
-        if msg == admin_pw:
-            # If user doesn't exist yet, create as admin (minimal profile)
-            if not user_get(handle):
-                user_upsert(handle, "admin", full_name=handle, phone="")
-            else:
-                user_set_role(handle, "admin")
-            await update.message.reply_text("Admin access granted.", reply_markup=main_menu_kb(handle))
-        else:
-            await update.message.reply_text("Wrong password.", reply_markup=main_menu_kb(handle))
-        context.user_data["awaiting"] = None
-        return
-
-    # ----- Registration (name then phone) -----
-    if awaiting == "REG_NAME":
-        context.user_data["reg_full_name"] = msg
-        context.user_data["awaiting"] = "REG_PHONE"
-        await update.message.reply_text("Phone number? (or type '-' to skip)")
-        return
-
-    if awaiting == "REG_PHONE":
-        phone = "" if msg == "-" else msg
-        role = context.user_data.get("reg_role", "individual")
-        full_name = context.user_data.get("reg_full_name", handle)
-
-        user_upsert(handle, role, full_name, phone)
-        if role == "individual":
-            individual_get_for_handle(handle)
-
-        context.user_data["awaiting"] = None
-        await update.message.reply_text("Registration complete.", reply_markup=main_menu_kb(handle))
-        return
-
-    # ----- Admin add-event wizard -----
-    if awaiting and awaiting.startswith("ADMIN_EVENT_"):
-        ev = context.user_data.get("admin_event", {})
-
-        if awaiting == "ADMIN_EVENT_TITLE":
-            ev["title"] = msg
-            context.user_data["admin_event"] = ev
-            context.user_data["awaiting"] = "ADMIN_EVENT_START"
-            await update.message.reply_text("Start datetime (YYYY-MM-DD HH:MM), e.g. 2026-01-19 14:30")
-            return
-
-        if awaiting == "ADMIN_EVENT_START":
-            ts = parse_local_datetime_to_ts(msg)
-            if ts is None:
-                await update.message.reply_text("Invalid format. Use YYYY-MM-DD HH:MM")
-                return
-            ev["start_ts"] = ts
-            context.user_data["admin_event"] = ev
-            context.user_data["awaiting"] = "ADMIN_EVENT_END"
-            await update.message.reply_text("End datetime (YYYY-MM-DD HH:MM)")
-            return
-
-        if awaiting == "ADMIN_EVENT_END":
-            ts = parse_local_datetime_to_ts(msg)
-            if ts is None:
-                await update.message.reply_text("Invalid format. Use YYYY-MM-DD HH:MM")
-                return
-            ev["end_ts"] = ts
-            if int(ev["end_ts"]) <= int(ev["start_ts"]):
-                await update.message.reply_text("End must be after start. Enter end datetime again.")
-                return
-            context.user_data["admin_event"] = ev
-            context.user_data["awaiting"] = "ADMIN_EVENT_CAP"
-            await update.message.reply_text("Capacity (number), e.g. 20")
-            return
-
-        if awaiting == "ADMIN_EVENT_CAP":
-            if not msg.isdigit() or int(msg) <= 0:
-                await update.message.reply_text("Capacity must be a positive integer.")
-                return
-            ev["capacity"] = int(msg)
-
-            # Create activity
-            act_id = admin_add_activity(ev["title"], ev["start_ts"], ev["end_ts"], ev["capacity"])
-
-            context.user_data["awaiting"] = None
-            context.user_data["admin_event"] = {}
-
-            await update.message.reply_text(
-                f"Event created: #{act_id}\n{ev['title']}\n🕒 {fmt_dt(ev['start_ts'])}–{time.strftime('%H:%M', time.localtime(ev['end_ts']))}\n👥 cap={ev['capacity']}",
-                reply_markup=main_menu_kb(handle),
-            )
-            return
-
-    # If they typed random text, show menu hint
-    await update.message.reply_text("Use /start and the menu buttons.", reply_markup=main_menu_kb(handle))
-
-# -----------------------
-# Command fallbacks (kept minimal)
-# -----------------------
-
-async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    handle = get_handle(update)
-    if not handle:
-        await update.message.reply_text("Set a Telegram username first (Settings → Username).")
-        return
-    # Send role buttons (button-first)
-    await update.message.reply_text("Choose your role:", reply_markup=register_role_kb())
-
-async def cmd_addperson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    handle = get_handle(update)
-    u = user_get(handle) if handle else None
+    u = user_get(handle)
     if not u or u[1] != "caregiver":
-        await update.message.reply_text("Only caregivers can add individuals. Register as caregiver first.", reply_markup=main_menu_kb(handle or ""))
+        await update.message.reply_text("Only caregivers can add individuals. Register as caregiver first.", reply_markup=main_menu_keyboard())
         return
     parts = (update.message.text or "").split(" ", 1)
     if len(parts) < 2 or not parts[1].strip():
         await update.message.reply_text("Usage: /addperson <name>")
         return
-    pid = caregiver_add_individual(handle, parts[1].strip())
-    await update.message.reply_text(f"Added individual (id={pid}).", reply_markup=main_menu_kb(handle))
+    pid = caregiver_add_person(handle, parts[1].strip())
+    await update.message.reply_text(f"Added individual: id={pid}", reply_markup=main_menu_keyboard())
 
-async def cmd_cancelfor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    handle = get_handle(update)
-    u = user_get(handle) if handle else None
-    if not u or u[1] != "caregiver":
-        await update.message.reply_text("Only caregivers can use /cancelfor.")
-        return
-    parts = (update.message.text or "").strip().split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        await update.message.reply_text("Usage: /cancelfor <activity_id> <person_id>")
-        return
-    activity_id = int(parts[1])
-    person_id = int(parts[2])
-    owned = {pid for pid, _ in caregiver_list_individuals(handle)}
-    if person_id not in owned:
-        await update.message.reply_text("That person_id does not belong to you.")
-        return
-    ok = cancel_booking(activity_id, person_id)
-    await update.message.reply_text("Cancelled." if ok else "No such booking.", reply_markup=main_menu_kb(handle))
-
-# -----------------------
-# App wiring
-# -----------------------
+# ---------- App wiring ----------
 
 def build_app(token: str) -> Application:
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("register", cmd_register))
-    app.add_handler(CommandHandler("addperson", cmd_addperson))
-    app.add_handler(CommandHandler("cancelfor", cmd_cancelfor))
+    app.add_handler(CommandHandler("addperson", addperson_cmd))
 
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    # Reply keyboard presses come as text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
+
+    # Inline keyboards
+    app.add_handler(CallbackQueryHandler(inline_callback))
 
     return app
 
 def main() -> None:
+    token = None
+    # read BOT_TOKEN from environment
+    import os
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN env var is missing.")
