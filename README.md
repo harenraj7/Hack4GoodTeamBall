@@ -1,5 +1,5 @@
 # MINDS Booking System (Telegram Bot) — Team Ball H4G
-Problem statement 3 - MINDS Problem Statement
+Problem statement - MINDS 1
 
 A Telegram bot prototype to reduce friction in activity sign-ups for individuals and caregivers, while reducing manual admin work (events + attendance lists).
 
